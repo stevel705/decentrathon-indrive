@@ -85,9 +85,10 @@ class CarConditionPredictor:
             
             # Уровень чистоты
             if self.clean_levels == 2:
-                clean_prob = torch.sigmoid(clean_logits).item()
-                clean_level = 1 if clean_prob >= 0.5 else 0
-                clean_probs = [1 - clean_prob, clean_prob]
+                # clean_logits предсказывает P(dirty), где 1=грязный, 0=чистый
+                dirty_prob = torch.sigmoid(clean_logits).item()
+                clean_level = 0 if dirty_prob >= 0.5 else 1  # инвертируем: dirty>=0.5 → clean_level=0 (грязный)
+                clean_probs = [dirty_prob, 1 - dirty_prob]  # [P(dirty), P(clean)]
             else:
                 clean_probs = torch.softmax(clean_logits, dim=1).cpu().numpy()[0]
                 clean_level = clean_probs.argmax()
@@ -570,7 +571,7 @@ async def main_page():
 
                 // Отображение вероятностей по уровням чистоты
                 const cleanProbsDiv = document.getElementById('clean-probabilities');
-                const labels = ['Грязный', 'Средней чистоты', 'Чистый'];
+                const labels = ['Грязный', 'Чистый'];  // Порядок соответствует [P(dirty), P(clean)]
                 let probsHtml = '';
                 
                 result.clean_probabilities.forEach((prob, index) => {
