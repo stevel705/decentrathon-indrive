@@ -35,53 +35,62 @@ DAMAGE_CLASSES = {
     7: "damaged wind shield"
 }
 
-class ConditionNet(nn.Module):
-    def __init__(self, backbone="convnext_tiny", clean_levels=2):
+class CleanlinessNet(nn.Module):
+    """
+    Binary classification network for car cleanliness detection.
+    Matches the architecture from train_cleanliness.py
+    """
+    
+    def __init__(self, backbone="convnext_tiny", pretrained=False, dropout=0.1):
         super().__init__()
+        
         if timm is None:
             raise ImportError("Please install timm: pip install timm")
         
-        self.backbone = timm.create_model(backbone, pretrained=False, num_classes=0, global_pool="avg")
+        # Load backbone without classification head
+        self.backbone = timm.create_model(
+            backbone, 
+            pretrained=pretrained, 
+            num_classes=0,  # Remove classification head
+            global_pool="avg"
+        )
+        
+        # Get feature dimension
         feat_dim = self.backbone.num_features
-        self.damage_head = nn.Linear(feat_dim, 1)
-        self.clean_head = nn.Linear(feat_dim, clean_levels if clean_levels > 2 else 1)
-        self.clean_levels = clean_levels
-
+        
+        # Binary classification head with dropout
+        self.classifier = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Linear(feat_dim, 1)  # Binary classification
+        )
+    
     def forward(self, x):
-        f = self.backbone(x)
-        d = self.damage_head(f).squeeze(1)
-        c = self.clean_head(f)
-        if self.clean_levels == 2:
-            c = c.squeeze(1)
-        return d, c
+        """Forward pass returning logits for binary classification"""
+        features = self.backbone(x)
+        logits = self.classifier(features).squeeze(1)  # [batch_size]
+        return logits
 
 class IntegratedCarAnalyzer:
     def __init__(self, condition_checkpoint_path: str, yolo_model_path: str, 
-                 backbone: str = "convnext_tiny", img_size: int = 384, clean_levels: int = 3):
+                 backbone: str = "convnext_tiny", img_size: int = 384):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.img_size = img_size
-        self.clean_levels = clean_levels
         
         # Загружаем модель состояния (чистота/грязность)
         print(f"Загружаем модель состояния: {condition_checkpoint_path}")
         condition_checkpoint = torch.load(condition_checkpoint_path, map_location=self.device, weights_only=False)
         
-        # Определяем количество уровней чистоты из размера clean_head в checkpoint
+        # Создаем модель для бинарной классификации чистоты
+        self.condition_model = CleanlinessNet(backbone=backbone, pretrained=False).to(self.device)
+        
+        # Загружаем веса модели
         if "model" in condition_checkpoint:
             model_state = condition_checkpoint["model"]
         else:
             model_state = condition_checkpoint
             
-        clean_head_shape = model_state["clean_head.weight"].shape[0]
-        actual_clean_levels = clean_head_shape if clean_head_shape > 2 else 2
-        
-        # Создаем модель с правильными параметрами
-        self.condition_model = ConditionNet(backbone=backbone, clean_levels=actual_clean_levels).to(self.device)
         self.condition_model.load_state_dict(model_state)
         self.condition_model.eval()
-        
-        # Обновляем self.clean_levels для корректной работы predict
-        self.clean_levels = actual_clean_levels
         
         # Загружаем YOLO модель для детекции повреждений
         print(f"Загружаем YOLO модель: {yolo_model_path}")
@@ -170,24 +179,21 @@ class IntegratedCarAnalyzer:
         
         # Делаем предсказание
         with torch.no_grad():
-            damage_logits, clean_logits = self.condition_model(x)
+            clean_logits = self.condition_model(x)
             
-            damage_prob = torch.sigmoid(damage_logits).cpu().item()
+            # Преобразуем в вероятности (sigmoid для бинарной классификации)
+            clean_prob = torch.sigmoid(clean_logits).cpu().item()
             
-            if self.clean_levels == 3:
-                clean_probs = torch.softmax(clean_logits, dim=1).cpu().numpy()[0]
-                clean_level = int(np.argmax(clean_probs))
-            else:
-                clean_prob = torch.sigmoid(clean_logits).cpu().item()
-                clean_probs = [1 - clean_prob, clean_prob]
-                clean_level = 1 if clean_prob >= 0.5 else 0
+            # clean_prob - это вероятность того, что автомобиль чистый
+            # В датасете: clean = 1 означает чистый, clean = 0 означает грязный
+            clean_level = 1 if clean_prob >= 0.5 else 0
+            clean_probs = [1 - clean_prob, clean_prob]  # [грязный, чистый]
         
         return {
-            "general_damage_probability": float(damage_prob),
-            "is_damaged_general": damage_prob >= 0.5,
             "clean_level": int(clean_level),
             "clean_probabilities": [float(p) for p in clean_probs],
-            "cleanliness_status": self._get_cleanliness_status(clean_level)
+            "cleanliness_status": self._get_cleanliness_status(clean_level),
+            "clean_confidence": float(clean_prob)
         }
     
     def _create_annotated_image(self, image: Image.Image, damage_results: Dict[str, Any]) -> str:
@@ -240,19 +246,11 @@ class IntegratedCarAnalyzer:
         return f"data:image/jpeg;base64,{img_str}"
     
     def _get_cleanliness_status(self, clean_level: int) -> Dict[str, str]:
-        """Определяет статус чистоты"""
-        if self.clean_levels == 3:
-            if clean_level == 0:
-                return {"status": "Грязный", "color": "#8B4513"}
-            elif clean_level == 1:
-                return {"status": "Умеренно загрязненный", "color": "#FFA500"}
-            else:
-                return {"status": "Чистый", "color": "#008000"}
+        """Определяет статус чистоты для бинарной классификации"""
+        if clean_level == 0:
+            return {"status": "Грязный", "color": "#8B4513"}
         else:
-            if clean_level == 0:
-                return {"status": "Грязный", "color": "#8B4513"}
-            else:
-                return {"status": "Чистый", "color": "#008000"}
+            return {"status": "Чистый", "color": "#008000"}
     
     def _get_overall_status(self, is_damaged: bool, cleanliness_results: Dict[str, Any]) -> Dict[str, Any]:
         """Определяет общий статус автомобиля"""
@@ -264,10 +262,6 @@ class IntegratedCarAnalyzer:
             status = "Требует мойки"
             color = "#FF8C00"
             priority = "medium"
-        elif self.clean_levels == 3 and cleanliness_results["clean_level"] == 1:  # Умеренно загрязненный
-            status = "Слегка загрязнен"
-            color = "#FFD700"
-            priority = "low"
         else:
             status = "В отличном состоянии"
             color = "#008000"
@@ -290,16 +284,13 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 def find_model_files():
     """Находит файлы моделей"""
     # Ищем модель состояния
-    condition_models = glob.glob("runs/**/best*.pt", recursive=True)
-    condition_model = None
+   
     
-    for model_path in condition_models:
-        if "best" in model_path and os.path.exists(model_path):
-            condition_model = model_path
-            break
+    # Если не найдено в runs, попробуем альтернативные пути
+    condition_model = "weights/dirt_weights.pt"
     
-    if not condition_model:
-        raise FileNotFoundError("Не найдена модель состояния! Убедитесь, что модель обучена.")
+    if not os.path.exists(condition_model):
+        raise FileNotFoundError(f"Не найдена модель состояния по пути: {condition_model}")
     
     # Ищем YOLO модель
     yolo_model_path = "weights/best_yolo_damage.pt"
