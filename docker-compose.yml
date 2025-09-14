@@ -1,0 +1,39 @@
+# Docker Compose configuration for Car Condition Analysis System
+# Provides development and production environments
+
+version: '3.8'
+
+services:
+  # Main application service
+  car-analyzer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    image: car-analyzer:latest
+    container_name: car-analyzer-app
+    ports:
+      - "${APP_PORT:-8000}:8000"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-""}
+    volumes:
+      # Mount data directories
+      - ./weights:/app/weights:ro
+      - ./logs:/app/logs
+    restart: unless-stopped
+    networks:
+      - car-analyzer-network
+    healthcheck:
+      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8000/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+
+networks:
+  car-analyzer-network:
+    driver: bridge
+    name: car-analyzer-network
+
