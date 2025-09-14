@@ -51,7 +51,32 @@ class CocoDetDataset(Dataset):
         ann_path = root / split / "_annotations.coco.json"
         self.coco = COCO(str(ann_path))
         self.root = root / split
-        self.ids = list(sorted(self.coco.imgs.keys()))
+        # Filter out images without valid annotations
+        all_ids = list(sorted(self.coco.imgs.keys()))
+        self.ids = []
+        for img_id in all_ids:
+            ann_ids = self.coco.getAnnIds(imgIds=[img_id])
+            anns = self.coco.loadAnns(ann_ids)
+            # Check if there are valid boxes
+            valid_boxes = 0
+            for a in anns:
+                name = self.coco.cats[a["category_id"]]["name"].lower()
+                # normalize typos
+                if "scracth" in name: 
+                    name = "scratch"
+                if "dunt" in name: 
+                    name = "dent"
+                if name.startswith("car"): 
+                    name = "car"
+                if name not in NAME2ID: 
+                    continue
+                x,y,w,h = a.get("bbox", [0,0,0,0])
+                if w > 0 and h > 0:
+                    valid_boxes += 1
+            if valid_boxes > 0:
+                self.ids.append(img_id)
+        
+        print(f"[INFO] {split}: {len(all_ids)} total images, {len(self.ids)} with valid annotations")
         self.augment = augment
         self.tf = T.Compose([T.ToTensor()])
 
@@ -108,6 +133,12 @@ class CocoDetDataset(Dataset):
                     masks.append(mask)
                 except Exception:
                     pass
+
+        if len(boxes) == 0:
+            # If no valid boxes, create a dummy small box to avoid training issues
+            boxes = [[0, 0, 1, 1]]
+            labels = [0]  # background class
+            masks = [np.zeros((H, W), dtype=np.uint8)]
 
         boxes  = torch.as_tensor(boxes, dtype=torch.float32)
         labels = torch.as_tensor(labels, dtype=torch.int64)
@@ -259,7 +290,9 @@ def coco_eval(model, dataset: CocoDetDataset, device, split: str, out_dir: Path,
             return None
         cocoDt = cocoGt.loadRes(results)  # больше не упадёт из-за 'info'
         E = COCOeval(cocoGt, cocoDt, iouType)
-        E.evaluate(); E.accumulate(); E.summarize()
+        E.evaluate()
+        E.accumulate()
+        E.summarize()
         keys = ["AP","AP50","AP75","APs","APm","APl"]
         vals = [float(v) for v in E.stats[:6]]
         return dict(zip(keys, vals))
