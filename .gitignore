@@ -10,6 +10,10 @@ wheels/
 .venv
 
 data/
+dataset_prepared/
 zero/
 runs*/
 *.zip
+weights/
+dataset/
+datasets/
